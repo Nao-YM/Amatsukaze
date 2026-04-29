@@ -3,10 +3,10 @@
 # デバッグモードとリリースモードの両方に対応
 
 # ビルド段階
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 # 変数の定義
-ARG UBUNTU_VERSION=22.04
+ARG UBUNTU_VERSION=24.04
 ARG ARCH=amd64
 ARG BUILD_MODE=release
 
@@ -18,15 +18,15 @@ ENV ARCH=${ARCH}
 ENV BUILD_MODE=${BUILD_MODE}
 
 # バージョン定義
-ENV AVISYNTHCUDAFILTERS_VER=0.7.1
+ENV AVISYNTHCUDAFILTERS_VER=0.7.3
 ENV AVISYNTH_VER=3.7.5
 ENV YADIFMOD2_VER=0.2.8
-ENV TIVTC_VER=v1.0.29
+ENV TIVTC_VER=v1.0.31
 ENV NNEDI3_REV=a93dbaea9f0dfc3f6d496a3fe01466bc22dd3a88
 ENV MASKTOOLS_REV=8291927bf6956981a6412d353da8ca39d49c9d3a
 ENV MVTOOLS_VER=2.7.46
 ENV RGTOOLS_VER=1.2
-ENV GPAC_VER=v2.4.0
+ENV GPAC_VER=v26.02.0
 ENV LSMASH_REV=18a9ed25c7ff79a7f4f4bf850c345c72179b8998
 ENV CHAPTER_EXE_REV=32880d45f088e574285a101e6a49b032bb04f6ea
 ENV JOIN_LOGO_SCP_VER=Ver4.1.0_Linux
@@ -36,29 +36,39 @@ ENV TSREADEX_VER=master-240517
 ENV PSISIARC_VER=master-230324
 ENV B24TOVTT_VER=master-220402
 
+# リポジトリの変更
+RUN sed -i.bak -E \
+  '/^URIs:/ { \
+    N; /Suites:.*-security/! { \
+      s@http://(jp\.)?archive\.ubuntu\.com/ubuntu/?@http://mirror.hashy0917.net/ubuntu/@; \
+      s@http://(jp\.)?ports\.ubuntu\.com/ubuntu-ports/?@https://mirror.hashy0917.net/ubuntu-ports/@; \
+    } \
+  }' \
+  /etc/apt/sources.list.d/ubuntu.sources
+
 # ビルドツールのインストール
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    git \
-    curl \
-    wget \
-    tzdata \
-    p7zip-full \
-    nasm \
-    cmake \
-    meson \
-    ninja-build \
-    pkg-config \
-    autoconf \
-    automake \
-    libtool \
-    openssl \
-    zlib1g \
-    libz-dev \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/* \
+        build-essential \
+        git \
+        curl \
+        wget \
+        tzdata \
+        p7zip-full \
+        nasm \
+        cmake \
+        meson \
+        ninja-build \
+        pkg-config \
+        autoconf \
+        automake \
+        libtool \
+        openssl \
+        zlib1g \
+        libz-dev \
+        libssl-dev \
     && apt-get clean \
-    && apt-get autoremove -y
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 # AviSynth+のインストール
 RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynth.deb \
@@ -189,15 +199,17 @@ RUN rm -rf /tmp/plugins \
     && rm -rf /usr/share/info/*
 
 # 実行段階
-FROM nvidia/cuda:11.8.0-base-ubuntu22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 # 変数の定義（実行段階でも使用）
-ARG UBUNTU_VERSION=22.04
-ARG UBUNTU_NAME=jammy
+ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_NAME=noble
 ARG ARCH=amd64
 ARG BUILD_MODE=release
 ARG ENABLE_FASTER_WHISPER=0
 ARG ENABLE_VCEENCC=0
+ARG ENABLE_QSVENCC=1
+ARG ENABLE_NVENCC=0
 
 # 環境変数の設定
 ENV DEBIAN_FRONTEND=noninteractive
@@ -210,8 +222,8 @@ ENV LANG=ja_JP.UTF-8
 ENV LC_ALL=ja_JP.UTF-8
 ENV LC_CTYPE=ja_JP.UTF-8
 
-ENV QSVENCC_VER=8.07
-ENV NVENCC_VER=9.13
+ENV QSVENCC_VER=8.09
+ENV NVENCC_VER=9.14
 ENV VCEENCC_VER=9.05
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
@@ -220,19 +232,36 @@ ENV AVISYNTHCUDAFILTERS_VER=0.7.3
 ENV AVISYNTH_VER=3.7.5
 ENV FASTER_WHISPER_VER=r245.4
 
+# リポジトリの変更
+RUN sed -i.bak -E \
+  '/^URIs:/ { \
+    N; /Suites:.*-security/! { \
+      s@http://(jp\.)?archive\.ubuntu\.com/ubuntu/?@http://mirror.hashy0917.net/ubuntu/@; \
+      s@http://(jp\.)?ports\.ubuntu\.com/ubuntu-ports/?@https://mirror.hashy0917.net/ubuntu-ports/@; \
+    } \
+  }' \
+  /etc/apt/sources.list.d/ubuntu.sources
+
 # 実行に必要なパッケージのみインストール（デバッグモードの場合はビルドツールも含める）
 # ENABLE_VCEENCC 時の AMF: repo.radeon.com amdgpu/6.4.4 pool は jammy(22.04): *_2202160.22.04_* と noble(24.04): *_2203192.24.04_* の二系統。ベース Ubuntu 22.04 のため前者を取得する。
-RUN apt-get update && apt-get install -y \
-    gpg \
-    ca-certificates \
-    curl \
-    wget \
-    tzdata \
-    software-properties-common \
-    p7zip-full \
-    && wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
-    && echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_NAME} unified" \
-      | tee /etc/apt/sources.list.d/intel-gpu-${UBUNTU_NAME}.list \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gpg \
+        ca-certificates \
+        curl \
+        wget \
+        tzdata \
+        p7zip-full \
+        nano \
+        gosu \
+        git \
+        xz-utils \
+        locales \
+        openssl \
+        zlib1g \
+        mkvtoolnix \
+        opus-tools \
+        && apt-get clean \
+        && apt-get autoremove -y \
     && if [ "$ENABLE_VCEENCC" = "1" ]; then \
         wget https://repo.radeon.com/amdgpu-install/${AMDGPU_INSTALL_VER}/ubuntu/${UBUNTU_NAME}/amdgpu-install_${AMDGPU_INSTALL_DEB_VER}_all.deb -O amdgpu-install.deb \
         && apt-get install -y ./amdgpu-install.deb \
@@ -254,36 +283,45 @@ RUN apt-get update && apt-get install -y \
             ./amf-amdgpu-pro_1.4.37-2202160.22.04_amd64.deb \
         && if [ ! -e /lib/x86_64-linux-gnu/libOpenCL.so ] && [ -e /lib/x86_64-linux-gnu/libOpenCL.so.1 ]; then \
             ln -s /lib/x86_64-linux-gnu/libOpenCL.so.1 /lib/x86_64-linux-gnu/libOpenCL.so; \
-        fi; \
-    fi \
-    && apt-get update \
-    && apt-get install -y \
-        gosu \
-        git \
-        xz-utils \
-        locales \
-        openssl \
-        zlib1g \
-        mkvtoolnix \
-        opus-tools \
-        intel-media-va-driver-non-free intel-opencl-icd libigfxcmrt7 libmfx1 libmfx-gen1.2 libva-drm2 libva-x11-2 ocl-icd-opencl-dev \
-        cuda-nvrtc-11-8 libnpp-11-8 \
-    && wget https://github.com/rigaya/QSVEnc/releases/download/${QSVENCC_VER}/qsvencc_${QSVENCC_VER}_${ARCH}.deb -O qsvencc.deb \
-        && apt-get install -y ./qsvencc.deb \
-        && rm ./qsvencc.deb \
-    && wget https://github.com/rigaya/NVEnc/releases/download/${NVENCC_VER}/nvencc_${NVENCC_VER}_${ARCH}.deb -O nvencc.deb \
-        && apt-get install -y ./nvencc.deb \
-        && rm ./nvencc.deb \
-    && if [ "$ENABLE_VCEENCC" = "1" ]; then \
-        wget https://github.com/rigaya/VCEEnc/releases/download/${VCEENCC_VER}/vceencc_${VCEENCC_VER}_${ARCH}.deb -O vceencc.deb \
+        fi \
+        && wget https://github.com/rigaya/VCEEnc/releases/download/${VCEENCC_VER}/vceencc_${VCEENCC_VER}_${ARCH}.deb -O vceencc.deb \
         && apt-get install -y ./vceencc.deb \
         && rm ./vceencc.deb; \
+    fi \
+    && if [ "$ENABLE_QSVENCC" = "1" ]; then \
+        wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
+        && echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_NAME} unified" \
+         | tee /etc/apt/sources.list.d/intel-gpu-${UBUNTU_NAME}.list \
+        && apt-get update && apt-get install -y --no-install-recommends \
+            intel-media-va-driver-non-free \
+            intel-opencl-icd \
+            libigfxcmrt7 \
+            libmfx1 \
+            libmfx-gen1.2 \
+            libva-drm2 \
+            libva-x11-2 \
+            ocl-icd-opencl-dev \
+        && apt-get clean \
+        && apt-get autoremove -y \
+        && wget https://github.com/rigaya/QSVEnc/releases/download/${QSVENCC_VER}/qsvencc_${QSVENCC_VER}_${ARCH}.deb -O qsvencc.deb \
+        && apt-get install -y ./qsvencc.deb \
+        && rm ./qsvencc.deb; \
+    fi \
+    && if [ "$ENABLE_NVENCC" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            cuda-nvrtc-11-8 \
+            libnpp-11-8 \
+        && apt-get clean \
+        && apt-get autoremove -y \
+        && wget https://github.com/rigaya/NVEnc/releases/download/${NVENCC_VER}/nvencc_${NVENCC_VER}_${ARCH}.deb -O nvencc.deb \
+        && apt-get install -y ./nvencc.deb \
+        && rm ./nvencc.deb; \
     fi \
     && wget https://github.com/rigaya/tsreplace/releases/download/${TSREPLACE_VER}/tsreplace_${TSREPLACE_VER}_${ARCH}.deb -O tsreplace.deb \
         && apt-get install -y ./tsreplace.deb \
         && rm ./tsreplace.deb \
     && if [ "$BUILD_MODE" = "debug" ]; then \
-        apt-get install -y \
+        apt-get install -y --no-install-recommends \
         software-properties-common \
         build-essential \
         nasm \
@@ -297,43 +335,38 @@ RUN apt-get update && apt-get install -y \
         libssl-dev \
         libz-dev; \
     fi \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && apt-get autoremove -y
-
-# タイムゾーンを確実にJSTへ固定
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone
-
-# 日本語ロケールの設定
-RUN locale-gen ja_JP.UTF-8 \
+# タイムゾーンを確実にJSTへ固定 \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+# 日本語ロケールの設定 \
+    && locale-gen ja_JP.UTF-8 \
     && locale-gen en_US.UTF-8 \
-    && update-locale LANG=ja_JP.UTF-8
-
-# .NET SDK 10.0のインストール（デバッグモードの場合のみ）
-RUN if [ "$BUILD_MODE" = "debug" ]; then \
+    && update-locale LANG=ja_JP.UTF-8 \
+# .NET SDK 10.0のインストール（デバッグモードの場合のみ）\
+    && if [ "$BUILD_MODE" = "debug" ]; then \
         apt add-apt-repository ppa:dotnet/backports \
         && apt update \
-        && apt install -y dotnet-sdk-10.0 \
-        && rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# AviSynth+/AvisynthCUDAFiltersのインストール（実行段階でも必要）
-RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynth.deb \
+        && apt install -y dotnet-sdk-10.0; \
+    fi \
+# AviSynth+/AvisynthCUDAFiltersのインストール（実行段階でも必要）\
+    && wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynth.deb \
     && apt-get install -y ./avisynth.deb \
     && rm ./avisynth.deb \
     && wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynthcudafilters_${AVISYNTHCUDAFILTERS_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynthcudafilters.deb \
     && apt-get install -y ./avisynthcudafilters.deb \
-    && rm ./avisynthcudafilters.deb
-
-RUN if [ "$ENABLE_FASTER_WHISPER" = "1" ]; then \
+    && rm ./avisynthcudafilters.deb \
+    && if [ "$ENABLE_FASTER_WHISPER" = "1" ]; then \
         wget https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_${FASTER_WHISPER_VER}_linux.7z -O faster-whisper.7z \
         && mkdir -p /opt /app/exe_files \
         && 7z x faster-whisper.7z -o/opt/ \
         && chmod 755 /opt/ \
         && ln -s /opt/Faster-Whisper-XXL /app/exe_files/Faster-Whisper-XXL \
         && rm faster-whisper.7z; \
-    fi
+    fi \
+#   最後の掃除 \
+    && apt-get clean \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* 
 
 # ライブラリパスの設定
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
@@ -342,15 +375,13 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 WORKDIR /app
 
 # ディレクトリ構造の作成
-RUN mkdir -p /app/bat /app/config /app/exe_files/plugins64 /app/recorded /app/logo /app/output /app/profile /app/temp
-
-# SCRename.py
-RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCRenamePy \
+RUN mkdir -p /app/bat /app/config /app/exe_files/plugins64 /app/recorded /app/logo /app/output /app/profile /app/temp \
+# SCRename.py \
+    && git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCRenamePy \
     && mkdir -p exe_files/SCRenamePy \
     && mv tmp_SCRenamePy/SCRename.* exe_files/SCRenamePy/ \
-    && rm -rf tmp_SCRenamePy
-
-RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
+    && rm -rf tmp_SCRenamePy \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
     && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/x265_4.1%2B241_amd64_linux.tar.xz -O x265.tar.xz \
     && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/SvtAv1EncApp_4.1.0-4_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && tar -xf x264.tar.xz -C /app/exe_files \
@@ -367,25 +398,17 @@ COPY --from=builder /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
 RUN curl -s https://api.github.com/repos/rigaya/Amatsukaze/releases/latest \
         | grep "browser_download_url.*tar.xz" | grep "Ubuntu${UBUNTU_VERSION}" | cut -d : -f 2,3 | tr -d \" \
         | wget -i - -O - | tar -xJ -C /app \
-        && if [ -f /app/scripts/install.sh ]; then /app/scripts/install.sh; fi
-
-# for debug
-#COPY Amatsukaze_Ubuntu22.04_r926.tar.xz /app
-#RUN tar -xJf /app/Amatsukaze_Ubuntu22.04_r926.tar.xz -C /app \
-#    && if [ -f /app/scripts/install.sh ]; then /app/scripts/install.sh; fi \
-#    && rm /app/Amatsukaze_Ubuntu22.04_r926.tar.xz
-
-# デバッグ用のシェルスクリプトを作成（デバッグモードの場合のみ）
-RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        && if [ -f /app/scripts/install.sh ]; then /app/scripts/install.sh; fi \
+# デバッグ用のシェルスクリプトを作成（デバッグモードの場合のみ）\
+    && if [ "$BUILD_MODE" = "debug" ]; then \
         echo '#!/bin/bash' > /app/debug-build.sh && \
         echo 'cd /app/Amatsukaze-src' >> /app/debug-build.sh && \
         echo './scripts/build.sh /app build --debug' >> /app/debug-build.sh && \
         echo 'if [ -f /app/scripts/install.sh ]; then /app/scripts/install.sh; fi' >> /app/debug-build.sh && \
         chmod +x /app/debug-build.sh; \
-    fi
-
-# エントリーポイントスクリプトを作成
-RUN cat <<'EOF' > /app/entrypoint.sh
+    fi \
+# エントリーポイントスクリプトを作成 \
+    && cat <<'EOF' > /app/entrypoint.sh
 #!/bin/bash
 set -e
 umask 022

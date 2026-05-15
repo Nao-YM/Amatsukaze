@@ -11,6 +11,7 @@ namespace Amatsukaze.Server.Rest
     internal class LogoAnalyzeJob
     {
         public string Id { get; set; }
+        public int QueueItemId { get; set; }
         public float Progress { get; set; }
         public int NumRead { get; set; }
         public int NumTotal { get; set; }
@@ -19,6 +20,50 @@ namespace Amatsukaze.Server.Rest
         public bool Completed { get; set; }
         public string Error { get; set; }
         public string LogoFilePath { get; set; }
+        public string DebugLogoFilePath { get; set; }
+    }
+
+    internal class LogoAutoDetectJob
+    {
+        public string Id { get; set; }
+        public float Progress { get; set; }
+        public int Stage { get; set; }
+        public float StageProgress { get; set; }
+        public int NumRead { get; set; }
+        public int NumTotal { get; set; }
+        public bool Completed { get; set; }
+        public string Error { get; set; }
+        public LogoRect DetectedRect { get; set; }
+        public LogoRectDetectFail RectDetectFail { get; set; }
+        public LogoAnalyzeFail LogoAnalyzeFail { get; set; }
+        public double? Pass1ScoreMax { get; set; }
+        public double? Pass2ScoreMax { get; set; }
+        public double? FinalScoreBeforeRescueMax { get; set; }
+        public bool Pass2Entered { get; set; }
+        public bool Pass2PrepareSucceeded { get; set; }
+        public bool Pass2CollectSucceeded { get; set; }
+        public bool Pass2RescueFallbackApplied { get; set; }
+        public LogoAnalyzeFail Pass2FailBeforeClear { get; set; }
+        public int Pass2FrameMaskNonZero { get; set; }
+        public int Pass2AcceptedFrames { get; set; }
+        public int Pass2SkippedFrames { get; set; }
+        public int FrameGateRetryAttemptCount { get; set; }
+        public int FrameGateRetrySuccessAttempt { get; set; }
+        public string ScoreImagePath { get; set; }
+        public string BinaryImagePath { get; set; }
+        public string CclImagePath { get; set; }
+        public string CountImagePath { get; set; }
+        public string AImagePath { get; set; }
+        public string BImagePath { get; set; }
+        public string AlphaImagePath { get; set; }
+        public string LogoYImagePath { get; set; }
+        public string ConsistencyImagePath { get; set; }
+        public string FgVarImagePath { get; set; }
+        public string BgVarImagePath { get; set; }
+        public string TransitionImagePath { get; set; }
+        public string KeepRateImagePath { get; set; }
+        public string AcceptedImagePath { get; set; }
+        public bool DetailedDebug { get; set; }
     }
 
     public class LogoAnalyzeService
@@ -26,6 +71,7 @@ namespace Amatsukaze.Server.Rest
         private readonly EncodeServer server;
         private readonly RestStateStore state;
         private readonly ConcurrentDictionary<string, LogoAnalyzeJob> jobs = new ConcurrentDictionary<string, LogoAnalyzeJob>();
+        private readonly ConcurrentDictionary<string, LogoAutoDetectJob> autoJobs = new ConcurrentDictionary<string, LogoAutoDetectJob>();
 
         public LogoAnalyzeService(EncodeServer server, RestStateStore state)
         {
@@ -62,6 +108,7 @@ namespace Amatsukaze.Server.Rest
             var job = new LogoAnalyzeJob()
             {
                 Id = Guid.NewGuid().ToString("N"),
+                QueueItemId = request.QueueItemId,
                 MaxFrames = request.MaxFrames
             };
             jobs[job.Id] = job;
@@ -79,6 +126,368 @@ namespace Amatsukaze.Server.Rest
                 return ToStatus(job);
             }
             return null;
+        }
+
+        public bool TryStartAutoDetect(LogoAutoDetectStartRequest request, out LogoAutoDetectStatus status, out string error)
+        {
+            status = null;
+            error = null;
+            if (request == null || request.QueueItemId <= 0)
+            {
+                error = "QueueItemIdが不正です";
+                return false;
+            }
+            if (!state.TryGetQueueItem(request.QueueItemId, out var item) || string.IsNullOrEmpty(item.SrcPath))
+            {
+                error = "キューの入力ファイルが見つかりません";
+                return false;
+            }
+            if (!File.Exists(item.SrcPath))
+            {
+                error = "入力ファイルが存在しません";
+                return false;
+            }
+            if (item.ServiceId <= 0)
+            {
+                error = "サービスIDが取得できません";
+                return false;
+            }
+            if (request.DivX <= 0 || request.DivY <= 0)
+            {
+                error = "div_x/div_yは1以上で指定してください";
+                return false;
+            }
+            if (request.SearchFrames < 100)
+            {
+                error = "search_frameは100以上で指定してください";
+                return false;
+            }
+            if (request.BlockSize < 4)
+            {
+                error = "block_sizeは4以上で指定してください";
+                return false;
+            }
+            if (request.Threshold < 1)
+            {
+                error = "thresholdは1以上で指定してください";
+                return false;
+            }
+            if (request.ThreadN < 0)
+            {
+                error = "thread_nは0以上で指定してください";
+                return false;
+            }
+
+            var job = new LogoAutoDetectJob()
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Stage = 1,
+                StageProgress = 0,
+                Progress = 0,
+                DetailedDebug = request.DetailedDebug
+            };
+            autoJobs[job.Id] = job;
+            Task.Run(() => RunAutoDetectJob(job, request, item.SrcPath, item.ServiceId));
+
+            status = ToAutoStatus(job);
+            return true;
+        }
+
+        public LogoAutoDetectStatus GetAutoDetectStatus(string id)
+        {
+            if (autoJobs.TryGetValue(id, out var job))
+            {
+                return ToAutoStatus(job);
+            }
+            return null;
+        }
+
+        public byte[] GetAutoDetectDebugImagePng(string id, string kind)
+        {
+            if (!autoJobs.TryGetValue(id, out var job))
+            {
+                return null;
+            }
+
+            static string AddSuffixToPath(string srcPath, string suffix)
+            {
+                if (string.IsNullOrEmpty(srcPath))
+                {
+                    return null;
+                }
+                var ext = Path.GetExtension(srcPath);
+                if (string.IsNullOrEmpty(ext))
+                {
+                    return srcPath + suffix;
+                }
+                return srcPath.Substring(0, srcPath.Length - ext.Length) + suffix;
+            }
+
+            static string AddInfixBeforeExtension(string srcPath, string infix)
+            {
+                if (string.IsNullOrEmpty(srcPath))
+                {
+                    return null;
+                }
+                var ext = Path.GetExtension(srcPath);
+                if (string.IsNullOrEmpty(ext))
+                {
+                    return srcPath + infix;
+                }
+                return srcPath.Substring(0, srcPath.Length - ext.Length) + infix + ext;
+            }
+
+            static bool TryResolveStagePath(string requestKind, string baseKind, string basePath, out string resolvedPath)
+            {
+                resolvedPath = null;
+                if (string.Equals(requestKind, baseKind, StringComparison.OrdinalIgnoreCase))
+                {
+                    resolvedPath = basePath;
+                    return true;
+                }
+                if (string.Equals(requestKind, baseKind + "-pass1", StringComparison.OrdinalIgnoreCase))
+                {
+                    resolvedPath = AddInfixBeforeExtension(basePath, ".pass1");
+                    return true;
+                }
+                if (string.Equals(requestKind, baseKind + "-pass2", StringComparison.OrdinalIgnoreCase))
+                {
+                    resolvedPath = AddInfixBeforeExtension(basePath, ".pass2");
+                    return true;
+                }
+                return false;
+            }
+
+            string path = null;
+            if (TryResolveStagePath(kind, "score", job.ScoreImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "binary", job.BinaryImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "ccl", job.CclImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "count", job.CountImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "a", job.AImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "b", job.BImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "alpha", job.AlphaImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "logoy", job.LogoYImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "meandiff", AddInfixBeforeExtension(job.ScoreImagePath, ".meandiff"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "consistency", job.ConsistencyImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "fgvar", job.FgVarImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "bgvar", job.BgVarImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "transition", job.TransitionImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "keeprate", job.KeepRateImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "accepted", job.AcceptedImagePath, out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "diffgain", AddInfixBeforeExtension(job.ScoreImagePath, ".diffgain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "diffgainraw", AddInfixBeforeExtension(job.ScoreImagePath, ".diffgainraw"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "residualgain", AddInfixBeforeExtension(job.ScoreImagePath, ".residualgain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "logogain", AddInfixBeforeExtension(job.ScoreImagePath, ".logogain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "consistencygain", AddInfixBeforeExtension(job.ScoreImagePath, ".consistencygain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "alphagain", AddInfixBeforeExtension(job.ScoreImagePath, ".alphagain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "bggain", AddInfixBeforeExtension(job.ScoreImagePath, ".bggain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "extremegain", AddInfixBeforeExtension(job.ScoreImagePath, ".extremegain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "temporalgain", AddInfixBeforeExtension(job.ScoreImagePath, ".temporalgain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "opaquepenalty", AddInfixBeforeExtension(job.ScoreImagePath, ".opaquepenalty"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "opaquestaticpenalty", AddInfixBeforeExtension(job.ScoreImagePath, ".opaquestaticpenalty"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "linefitgain", AddInfixBeforeExtension(job.ScoreImagePath, ".linefitgain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "domresidualpenalty", AddInfixBeforeExtension(job.ScoreImagePath, ".domresidualpenalty"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "splitbranchgain", AddInfixBeforeExtension(job.ScoreImagePath, ".splitbranchgain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "splitbranchpenalty", AddInfixBeforeExtension(job.ScoreImagePath, ".splitbranchpenalty"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "edgepresence", AddInfixBeforeExtension(job.ScoreImagePath, ".edgepresence"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "edgemean", AddInfixBeforeExtension(job.ScoreImagePath, ".edgemean"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "edgevar", AddInfixBeforeExtension(job.ScoreImagePath, ".edgevar"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "rescuescore", AddInfixBeforeExtension(job.ScoreImagePath, ".rescuescore"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "presencegain", AddInfixBeforeExtension(job.ScoreImagePath, ".presencegain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "maggain", AddInfixBeforeExtension(job.ScoreImagePath, ".maggain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "uppergate", AddInfixBeforeExtension(job.ScoreImagePath, ".uppergate"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "consistgain", AddInfixBeforeExtension(job.ScoreImagePath, ".consistgain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "bgvargain", AddInfixBeforeExtension(job.ScoreImagePath, ".bgvargain"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "iswall", AddInfixBeforeExtension(job.ScoreImagePath, ".iswall"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "isinterior", AddInfixBeforeExtension(job.ScoreImagePath, ".isinterior"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "uppergatefilled", AddInfixBeforeExtension(job.ScoreImagePath, ".uppergatefilled"), out path))
+            {
+            }
+            else if (TryResolveStagePath(kind, "traceplot", AddInfixBeforeExtension(job.BinaryImagePath, ".traceplot"), out path))
+            {
+            }
+            else if (string.Equals(kind, "pass2prep-logo", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddInfixBeforeExtension(job.ScoreImagePath, ".pass2prep-logo");
+            }
+            else if (string.Equals(kind, "pass2prep-mask", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddInfixBeforeExtension(job.BinaryImagePath, ".pass2prep-mask");
+            }
+            else if (string.Equals(kind, "framegate", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".framegate.csv");
+            }
+            else if (string.Equals(kind, "itercsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".iter.csv");
+            }
+            else if (string.Equals(kind, "promotecsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".promote.csv");
+            }
+            else if (string.Equals(kind, "deltacsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".delta.csv");
+            }
+            else if (string.Equals(kind, "rectmergecsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".rectmerge.csv");
+            }
+            else if (string.Equals(kind, "compscorecsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".compscore.csv");
+            }
+            else if (string.Equals(kind, "tracecsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".trace.csv");
+            }
+            else if (string.Equals(kind, "tracecsv-pass1", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(AddInfixBeforeExtension(job.BinaryImagePath, ".pass1"), ".trace.csv");
+            }
+            else if (string.Equals(kind, "tracecsv-pass2", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(AddInfixBeforeExtension(job.BinaryImagePath, ".pass2"), ".trace.csv");
+            }
+            else if (string.Equals(kind, "tracesummarycsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".trace.summary.csv");
+            }
+            else if (string.Equals(kind, "tracesummarycsv-pass1", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(AddInfixBeforeExtension(job.BinaryImagePath, ".pass1"), ".trace.summary.csv");
+            }
+            else if (string.Equals(kind, "tracesummarycsv-pass2", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(AddInfixBeforeExtension(job.BinaryImagePath, ".pass2"), ".trace.summary.csv");
+            }
+            else if (string.Equals(kind, "tracebincsv", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(job.BinaryImagePath, ".trace.bin.csv");
+            }
+            else if (string.Equals(kind, "tracebincsv-pass1", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(AddInfixBeforeExtension(job.BinaryImagePath, ".pass1"), ".trace.bin.csv");
+            }
+            else if (string.Equals(kind, "tracebincsv-pass2", StringComparison.OrdinalIgnoreCase))
+            {
+                path = AddSuffixToPath(AddInfixBeforeExtension(job.BinaryImagePath, ".pass2"), ".trace.bin.csv");
+            }
+            else if (string.Equals(kind, "pixeldumpcsv", StringComparison.OrdinalIgnoreCase))
+            {
+                // C++側は replaceExtensionWithSuffix(path.score, ".pixeldump.csv") で生成
+                // 例: score.png → score.pixeldump.csv
+                var dir = Path.GetDirectoryName(job.ScoreImagePath) ?? "";
+                var noExt = Path.GetFileNameWithoutExtension(job.ScoreImagePath);
+                path = Path.Combine(dir, noExt + ".pixeldump.csv");
+            }
+            else if (string.Equals(kind, "pixeldumpcsv-pass2", StringComparison.OrdinalIgnoreCase))
+            {
+                // pass2 variant: score.pass2.pixeldump.csv
+                var scorePass2 = AddInfixBeforeExtension(job.ScoreImagePath, ".pass2");
+                var dir = Path.GetDirectoryName(scorePass2) ?? "";
+                var noExt = Path.GetFileNameWithoutExtension(scorePass2);
+                path = Path.Combine(dir, noExt + ".pixeldump.csv");
+            }
+
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                return null;
+            }
+            try
+            {
+                var bitmap = BitmapManager.CreateBitmapFromFile(path);
+                using var ms = new MemoryStream();
+                BitmapManager.SaveBitmapAsPng(bitmap, ms);
+                return ms.ToArray();
+            }
+            catch
+            {
+                return File.ReadAllBytes(path);
+            }
         }
 
         public bool TryApply(string id, out string error)
@@ -107,7 +516,8 @@ namespace Amatsukaze.Server.Rest
                 {
                     ServiceId = serviceId,
                     LogoIdx = 1,
-                    Data = data
+                    Data = data,
+                    SourceQueueItemId = job.QueueItemId
                 }).GetAwaiter().GetResult();
                 server.RequestLogoRescan();
                 return true;
@@ -173,6 +583,190 @@ namespace Amatsukaze.Server.Rest
             return null;
         }
 
+        public byte[] GetDebugLogoImagePng(string id)
+        {
+            if (jobs.TryGetValue(id, out var job))
+            {
+                if (!string.IsNullOrEmpty(job.DebugLogoFilePath) && File.Exists(job.DebugLogoFilePath))
+                {
+                    using (var ctx = new AMTContext())
+                    using (var logo = new LogoFile(ctx, job.DebugLogoFilePath))
+                    using (var ms = new MemoryStream())
+                    {
+                        var image = logo.GetImage(0);
+                        BitmapManager.SaveBitmapAsPng(image, ms);
+                        return ms.ToArray();
+                    }
+                }
+            }
+            return null;
+        }
+
+        private static void SetAutoProgress(LogoAutoDetectJob job, int stage, float stageProgress, float progress)
+        {
+            job.Stage = stage;
+            job.StageProgress = stageProgress;
+            job.Progress = progress;
+        }
+
+        private void RunAutoDetectJob(LogoAutoDetectJob job, LogoAutoDetectStartRequest request, string filePath, int serviceId)
+        {
+            try
+            {
+                var threadN = AutoLogoThreadResolver.Resolve(request.ThreadN);
+                var progressLogger = new global::Amatsukaze.Server.LogoAutoDetectProgressLogger($"[LogoAutoDetectRest] job={job.Id} qid={request.QueueItemId}", filePath);
+                var baseWork = server.AppData_?.setting?.WorkPath;
+                if (string.IsNullOrEmpty(baseWork))
+                {
+                    baseWork = Directory.GetCurrentDirectory();
+                }
+                Directory.CreateDirectory(baseWork);
+                global::Amatsukaze.Server.Util.AddLog(
+                    "[LogoAutoDetectRest] 開始: " +
+                    "job=" + job.Id +
+                    ", qid=" + request.QueueItemId +
+                    ", sid=" + serviceId +
+                    ", file=" + filePath +
+                    ", autoDetect={div=" + request.DivX + "x" + request.DivY +
+                    ", searchFrames=" + request.SearchFrames +
+                    ", blockSize=" + request.BlockSize +
+                    ", threshold=" + request.Threshold +
+                    ", margin=(" + request.MarginX + "," + request.MarginY + ")" +
+                    ", threadN=" + threadN +
+                    ", detailedDebug=" + request.DetailedDebug + "}",
+                    null);
+
+                using (var ctx = new AMTContext())
+                {
+                    var scorePath = Path.Combine(baseWork, $"logo-auto-score-{job.Id}.bmp");
+                    var binaryPath = Path.Combine(baseWork, $"logo-auto-binary-{job.Id}.bmp");
+                    var cclPath = Path.Combine(baseWork, $"logo-auto-ccl-{job.Id}.bmp");
+                    var countPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-count-{job.Id}.bmp") : null;
+                    var aPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-a-{job.Id}.bmp") : null;
+                    var bPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-b-{job.Id}.bmp") : null;
+                    var alphaPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-alpha-{job.Id}.bmp") : null;
+                    var logoYPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-logoy-{job.Id}.bmp") : null;
+                    var consistencyPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-consistency-{job.Id}.bmp") : null;
+                    var fgVarPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-fgvar-{job.Id}.bmp") : null;
+                    var bgVarPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-bgvar-{job.Id}.bmp") : null;
+                    var transitionPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-transition-{job.Id}.bmp") : null;
+                    var keepRatePath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-keeprate-{job.Id}.bmp") : null;
+                    var acceptedPath = request.DetailedDebug ? Path.Combine(baseWork, $"logo-auto-accepted-{job.Id}.bmp") : null;
+                    job.ScoreImagePath = scorePath;
+                    job.BinaryImagePath = binaryPath;
+                    job.CclImagePath = cclPath;
+                    job.CountImagePath = countPath;
+                    job.AImagePath = aPath;
+                    job.BImagePath = bPath;
+                    job.AlphaImagePath = alphaPath;
+                    job.LogoYImagePath = logoYPath;
+                    job.ConsistencyImagePath = consistencyPath;
+                    job.FgVarImagePath = fgVarPath;
+                    job.BgVarImagePath = bgVarPath;
+                    job.TransitionImagePath = transitionPath;
+                    job.KeepRateImagePath = keepRatePath;
+                    job.AcceptedImagePath = acceptedPath;
+
+                    int x = 0;
+                    int y = 0;
+                    int w = 0;
+                    int h = 0;
+                    var result = LogoFile.AutoDetectLogoRect(
+                        ctx, filePath, serviceId,
+                        request.DivX, request.DivY, request.SearchFrames, request.BlockSize, request.Threshold,
+                        request.MarginX, request.MarginY, threadN,
+                        scorePath, binaryPath, cclPath, countPath, aPath, bPath, alphaPath, logoYPath, consistencyPath, fgVarPath, bgVarPath, transitionPath, keepRatePath, acceptedPath,
+                        request.DetailedDebug,
+                        (stage, stageProgress, progress, nread, total) =>
+                        {
+                            progressLogger.Report(stage, stageProgress, progress, nread, total);
+                            job.Stage = stage;
+                            job.StageProgress = stageProgress;
+                            job.Progress = progress;
+                            job.NumRead = nread;
+                            job.NumTotal = total;
+                            return true;
+                        });
+                    job.RectDetectFail = result.RectDetectFail;
+                    job.LogoAnalyzeFail = result.LogoAnalyzeFail;
+                    job.Pass1ScoreMax = result.Pass1ScoreMax;
+                    job.Pass2ScoreMax = result.Pass2ScoreMax;
+                    job.FinalScoreBeforeRescueMax = result.FinalScoreBeforeRescueMax;
+                    job.Pass2Entered = result.Pass2Entered;
+                    job.Pass2PrepareSucceeded = result.Pass2PrepareSucceeded;
+                    job.Pass2CollectSucceeded = result.Pass2CollectSucceeded;
+                    job.Pass2RescueFallbackApplied = result.Pass2RescueFallbackApplied;
+                    job.Pass2FailBeforeClear = result.Pass2FailBeforeClear;
+                    job.Pass2FrameMaskNonZero = result.Pass2FrameMaskNonZero;
+                    job.Pass2AcceptedFrames = result.Pass2AcceptedFrames;
+                    job.Pass2SkippedFrames = result.Pass2SkippedFrames;
+                    job.FrameGateRetryAttemptCount = result.FrameGateRetryAttemptCount;
+                    job.FrameGateRetrySuccessAttempt = result.FrameGateRetrySuccessAttempt;
+                    x = result.X;
+                    y = result.Y;
+                    w = result.W;
+                    h = result.H;
+
+                    job.DetectedRect = new LogoRect
+                    {
+                        X = x,
+                        Y = y,
+                        Width = w,
+                        Height = h
+                    };
+                    global::Amatsukaze.Server.Util.AddLog(
+                        "[LogoAutoDetectRest] 完了: " +
+                        "job=" + job.Id +
+                        ", qid=" + request.QueueItemId +
+                        ", rect=(" + x + "," + y + "," + w + "," + h + ")" +
+                        ", pass2={entered=" + result.Pass2Entered +
+                        ", prepare=" + result.Pass2PrepareSucceeded +
+                        ", collect=" + result.Pass2CollectSucceeded +
+                        ", fallback=" + result.Pass2RescueFallbackApplied +
+                        ", acceptedFrames=" + result.Pass2AcceptedFrames +
+                        ", skippedFrames=" + result.Pass2SkippedFrames + "}",
+                        null);
+                    SetAutoProgress(job, 4, 1.0f, 1.0f);
+                }
+
+                job.Completed = true;
+                }
+                catch (AutoDetectLogoRectException ex)
+                {
+                    global::Amatsukaze.Server.Util.AddLog(
+                        "[LogoAutoDetectRest] 失敗: " +
+                        "job=" + job.Id +
+                        ", qid=" + request.QueueItemId +
+                        ", rectDetectFail=" + ex.RectDetectFail +
+                        ", logoAnalyzeFail=" + ex.LogoAnalyzeFail +
+                        ", error=" + ex.Message,
+                        ex);
+                    job.RectDetectFail = ex.RectDetectFail;
+                    job.LogoAnalyzeFail = ex.LogoAnalyzeFail;
+                    job.Pass1ScoreMax = ex.Pass1ScoreMax;
+                    job.Pass2ScoreMax = ex.Pass2ScoreMax;
+                    job.FinalScoreBeforeRescueMax = ex.FinalScoreBeforeRescueMax;
+                    job.Pass2Entered = ex.Pass2Entered;
+                    job.Pass2PrepareSucceeded = ex.Pass2PrepareSucceeded;
+                    job.Pass2CollectSucceeded = ex.Pass2CollectSucceeded;
+                    job.Pass2RescueFallbackApplied = ex.Pass2RescueFallbackApplied;
+                    job.Pass2FailBeforeClear = ex.Pass2FailBeforeClear;
+                    job.Pass2FrameMaskNonZero = ex.Pass2FrameMaskNonZero;
+                    job.Pass2AcceptedFrames = ex.Pass2AcceptedFrames;
+                    job.Pass2SkippedFrames = ex.Pass2SkippedFrames;
+                    job.FrameGateRetryAttemptCount = ex.FrameGateRetryAttemptCount;
+                    job.FrameGateRetrySuccessAttempt = ex.FrameGateRetrySuccessAttempt;
+                    job.Error = ex.Message;
+                    job.Completed = true;
+                }
+                catch (Exception ex)
+                {
+                    global::Amatsukaze.Server.Util.AddLog($"[LogoAutoDetectRest] 失敗: job={job.Id}, qid={request.QueueItemId}, error={ex.Message}", ex);
+                    job.Error = ex.Message;
+                    job.Completed = true;
+                }
+        }
+
         private void RunJob(LogoAnalyzeJob job, LogoAnalyzeStartRequest request, string filePath, int serviceId)
         {
             try
@@ -187,6 +781,7 @@ namespace Amatsukaze.Server.Rest
                 var workfile = Path.Combine(baseWork, "logotmp-" + job.Id + ".dat");
                 var tmppath = Path.Combine(baseWork, "logotmp-" + job.Id + ".lgd");
                 var outpath = Path.Combine(baseWork, "logo-" + job.Id + ".lgd");
+                var debugpath = Path.Combine(baseWork, "logo-debug-" + job.Id + ".lgd");
 
                 int imgx = (int)Math.Floor(request.X / 2.0) * 2;
                 int imgy = (int)Math.Floor(request.Y / 2.0) * 2;
@@ -195,7 +790,7 @@ namespace Amatsukaze.Server.Rest
 
                 using (var ctx = new AMTContext())
                 {
-                    LogoFile.ScanLogo(ctx, filePath, serviceId, workfile, tmppath,
+                    LogoFile.ScanLogo(ctx, filePath, serviceId, workfile, tmppath, debugpath,
                         imgx, imgy, w, h, request.Threshold, request.MaxFrames, (progress, nread, total, ngather) =>
                         {
                             job.Progress = progress;
@@ -203,7 +798,7 @@ namespace Amatsukaze.Server.Rest
                             job.NumTotal = total;
                             job.NumValid = ngather;
                             return true;
-                        });
+                        }, request.ValidateQuality);
 
                     using (var info = new TsInfo(ctx))
                     {
@@ -244,43 +839,159 @@ namespace Amatsukaze.Server.Rest
                 }
 
                 job.LogoFilePath = outpath;
+                if (File.Exists(debugpath))
+                {
+                    File.Delete(debugpath);
+                }
                 job.Completed = true;
             }
             catch (Exception ex)
             {
+                var debugpath = Path.Combine(server.AppData_?.setting?.WorkPath ?? Directory.GetCurrentDirectory(), "logo-debug-" + job.Id + ".lgd");
+                if (File.Exists(debugpath))
+                {
+                    job.DebugLogoFilePath = debugpath;
+                }
                 job.Error = ex.Message;
                 job.Completed = true;
             }
         }
 
-    private static LogoAnalyzeStatus ToStatus(LogoAnalyzeJob job)
-    {
-        var pass = 1;
-        if (job.Completed)
+        private static LogoAnalyzeStatus ToStatus(LogoAnalyzeJob job)
         {
-            pass = 3;
+            var pass = 1;
+            if (job.Completed)
+            {
+                pass = 3;
+            }
+            else if (job.Progress >= 75.0f)
+            {
+                pass = 3;
+            }
+            else if (job.Progress >= 50.0f)
+            {
+                pass = 2;
+            }
+            return new LogoAnalyzeStatus()
+            {
+                JobId = job.Id,
+                Completed = job.Completed,
+                Error = job.Error,
+                Progress = job.Progress,
+                NumRead = job.NumRead,
+                NumTotal = job.NumTotal,
+                NumValid = job.NumValid,
+                Pass = pass,
+                LogoFileName = string.IsNullOrEmpty(job.LogoFilePath) ? null : Path.GetFileName(job.LogoFilePath),
+                ImageUrl = job.Completed && !string.IsNullOrEmpty(job.LogoFilePath) ? $"/api/logo/analyze/{job.Id}/image" : null,
+                DebugImageUrl = job.Completed && !string.IsNullOrEmpty(job.DebugLogoFilePath) ? $"/api/logo/analyze/{job.Id}/debug-image" : null
+            };
         }
-        else if (job.Progress >= 75.0f)
+
+        private static LogoAutoDetectStatus ToAutoStatus(LogoAutoDetectJob job)
         {
-            pass = 3;
+            var stageName = job.Stage switch
+            {
+                1 => "初期フレーム走査",
+                2 => "仮推定とFrameGate準備",
+                3 => "最終推定と矩形確定",
+                4 => "完了",
+                _ => "待機中"
+            };
+            var debug = new LogoAutoDetectDebugImages();
+            if (!string.IsNullOrEmpty(job.ScoreImagePath))
+            {
+                debug.ScoreUrl = $"/api/logo/analyze/auto/{job.Id}/debug/score";
+            }
+            if (!string.IsNullOrEmpty(job.BinaryImagePath))
+            {
+                debug.BinaryUrl = $"/api/logo/analyze/auto/{job.Id}/debug/binary";
+            }
+            if (!string.IsNullOrEmpty(job.CclImagePath))
+            {
+                debug.CclUrl = $"/api/logo/analyze/auto/{job.Id}/debug/ccl";
+            }
+            if (!string.IsNullOrEmpty(job.CountImagePath))
+            {
+                debug.CountUrl = $"/api/logo/analyze/auto/{job.Id}/debug/count";
+            }
+            if (!string.IsNullOrEmpty(job.AImagePath))
+            {
+                debug.AUrl = $"/api/logo/analyze/auto/{job.Id}/debug/a";
+            }
+            if (!string.IsNullOrEmpty(job.BImagePath))
+            {
+                debug.BUrl = $"/api/logo/analyze/auto/{job.Id}/debug/b";
+            }
+            if (!string.IsNullOrEmpty(job.AlphaImagePath))
+            {
+                debug.AlphaUrl = $"/api/logo/analyze/auto/{job.Id}/debug/alpha";
+            }
+            if (!string.IsNullOrEmpty(job.LogoYImagePath))
+            {
+                debug.LogoYUrl = $"/api/logo/analyze/auto/{job.Id}/debug/logoy";
+            }
+            if (!string.IsNullOrEmpty(job.ConsistencyImagePath))
+            {
+                debug.ConsistencyUrl = $"/api/logo/analyze/auto/{job.Id}/debug/consistency";
+            }
+            if (!string.IsNullOrEmpty(job.FgVarImagePath))
+            {
+                debug.FgVarUrl = $"/api/logo/analyze/auto/{job.Id}/debug/fgvar";
+            }
+            if (!string.IsNullOrEmpty(job.BgVarImagePath))
+            {
+                debug.BgVarUrl = $"/api/logo/analyze/auto/{job.Id}/debug/bgvar";
+            }
+            if (!string.IsNullOrEmpty(job.TransitionImagePath))
+            {
+                debug.TransitionUrl = $"/api/logo/analyze/auto/{job.Id}/debug/transition";
+            }
+            if (!string.IsNullOrEmpty(job.KeepRateImagePath))
+            {
+                debug.KeepRateUrl = $"/api/logo/analyze/auto/{job.Id}/debug/keeprate";
+            }
+            if (!string.IsNullOrEmpty(job.AcceptedImagePath))
+            {
+                debug.AcceptedUrl = $"/api/logo/analyze/auto/{job.Id}/debug/accepted";
+            }
+            if (job.DetailedDebug && !string.IsNullOrEmpty(job.BinaryImagePath))
+            {
+                debug.FrameGateUrl = $"/api/logo/analyze/auto/{job.Id}/debug/framegate";
+            }
+
+            return new LogoAutoDetectStatus()
+            {
+                JobId = job.Id,
+                Completed = job.Completed,
+                Error = job.Error,
+                Progress = job.Progress,
+                Stage = job.Stage,
+                StageName = stageName,
+                StageProgress = job.StageProgress,
+                NumRead = job.NumRead,
+                NumTotal = job.NumTotal,
+                DetectedRect = job.DetectedRect,
+                RectDetectFailCode = (int)job.RectDetectFail,
+                RectDetectFailName = job.RectDetectFail.ToString(),
+                LogoAnalyzeFailCode = (int)job.LogoAnalyzeFail,
+                LogoAnalyzeFailName = job.LogoAnalyzeFail.ToString(),
+                Pass1ScoreMax = job.Pass1ScoreMax,
+                Pass2ScoreMax = job.Pass2ScoreMax,
+                FinalScoreBeforeRescueMax = job.FinalScoreBeforeRescueMax,
+                Pass2Entered = job.Pass2Entered,
+                Pass2PrepareSucceeded = job.Pass2PrepareSucceeded,
+                Pass2CollectSucceeded = job.Pass2CollectSucceeded,
+                Pass2RescueFallbackApplied = job.Pass2RescueFallbackApplied,
+                Pass2FailBeforeClearCode = (int)job.Pass2FailBeforeClear,
+                Pass2FailBeforeClearName = job.Pass2FailBeforeClear.ToString(),
+                Pass2FrameMaskNonZero = job.Pass2FrameMaskNonZero,
+                Pass2AcceptedFrames = job.Pass2AcceptedFrames,
+                Pass2SkippedFrames = job.Pass2SkippedFrames,
+                FrameGateRetryAttemptCount = job.FrameGateRetryAttemptCount,
+                FrameGateRetrySuccessAttempt = job.FrameGateRetrySuccessAttempt,
+                DebugImages = debug
+            };
         }
-        else if (job.Progress >= 50.0f)
-        {
-            pass = 2;
-        }
-        return new LogoAnalyzeStatus()
-        {
-            JobId = job.Id,
-            Completed = job.Completed,
-            Error = job.Error,
-            Progress = job.Progress,
-            NumRead = job.NumRead,
-            NumTotal = job.NumTotal,
-            NumValid = job.NumValid,
-            Pass = pass,
-            LogoFileName = string.IsNullOrEmpty(job.LogoFilePath) ? null : Path.GetFileName(job.LogoFilePath),
-            ImageUrl = job.Completed && !string.IsNullOrEmpty(job.LogoFilePath) ? $"/api/logo/analyze/{job.Id}/image" : null
-        };
     }
-}
 }

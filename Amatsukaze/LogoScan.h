@@ -20,6 +20,7 @@
 #include "ReaderWriterFFmpeg.h"
 
 #include <cmath>
+#include <functional>
 #include <numeric>
 #include <vector>
 #include <fstream>
@@ -31,15 +32,49 @@ void removeLogoLine(float *dst, const float *src, const int srcStride, const flo
 // ComputeKernel.cpp
 bool IsAVXAvailable();
 bool IsAVX2Available();
+bool IsAVX512BWAvailable();
 float CalcCorrelation5x5_AVX(const float* k, const float* Y, int x, int y, int w, float* pavg);
 float CalcCorrelation5x5_AVX2(const float* k, const float* Y, int x, int y, int w, float* pavg);
 void removeLogoLineAVX2(float *dst, const float *src, const int srcStride, const float *logoAY, const float *logoBY, const int logowidth, const float maxv, const float fade);
+void BilateralFilter5x5U8RangeLUT_AVX2(uint8_t* dst, const uint8_t* srcBase, int srcPitch, int w, int h, const float* spatial, const float* rangeWeight, uint8_t maxv, int y0, int y1);
+void BilateralFilter5x5U8RangeLUT_AVX512(uint8_t* dst, const uint8_t* srcBase, int srcPitch, int w, int h, const float* spatial, const float* rangeWeight, uint8_t maxv, int y0, int y1);
+bool TryEstimateBgEvalSideHorizontalInRangeU8_65_AVX2(const uint8_t* ptr, int threshold, float& avg, uint8_t& minvOut, uint8_t& maxvOut);
+bool TryEstimateBgEvalSideHorizontalInRangeU8_LE64_AVX2(const uint8_t* ptr, int len, int threshold, float& avg, uint8_t& minvOut, uint8_t& maxvOut);
 
 #if 0
 float CalcCorrelation5x5_Debug(const float* k, const float* Y, int x, int y, int w, float* pavg);
 #endif
 
 namespace logo {
+
+enum class LogoColorMode {
+    NormalYUV,
+    YOnlyNeutralUV,
+};
+
+struct LogoQualityMetrics {
+    int pixelCount = 0;
+    int activePixels = 0;
+    int opaquePixels = 0;
+    int edgeBand = 0;
+    int edgePixels = 0;
+    int edgeActivePixels = 0;
+    double activeAreaRate = 0.0;
+    double opaqueAreaRate = 0.0;
+    double edgeActiveRate = 0.0;
+    double edgeActiveAreaRate = 0.0;
+    double edgeSideActiveRateMax = 0.0;
+    double edgeSideActiveRate[4] = {};
+    double renderedYMean = 0.0;
+    double renderedYP99 = 0.0;
+    double alphaMean = 0.0;
+    double alphaP90 = 0.0;
+    double alphaP99 = 0.0;
+    double yResidualActiveMean = 0.0;
+    double yResidualActiveP90 = 0.0;
+    double uvResidualActiveMean = 0.0;
+    double uvResidualActiveP90 = 0.0;
+};
 
 class LogoDataParam : public LogoData {
     enum {
@@ -109,6 +144,8 @@ public:
     * 		回帰直線の傾きと切片を返す X軸:前景 Y軸:背景
     *===================================================================*/
     bool GetAB(float& A, float& B, int data_count) const;
+
+    double CalcResidualRms(float A, float B, int data_count) const;
 };
 
 class LogoScan {
@@ -133,12 +170,21 @@ class LogoScan {
     static void maxfilter(float *data, float *work, int w, int h);
 
 public:
-    // thy: オリジナルだとデフォルト30*8=240（8bitだと12くらい？）
+    // thy: 単色背景判定の許容幅(8bit換算で概ね12付近を想定)。
+    // 背景:
+    //   外周画素のばらつきが大きいフレームを除外し、bg推定を安定させるための閾値。
+    //   ここが緩すぎると、レターボックス帯やテロップが混入して
+    //   後段のfg/bg回帰が歪み、ロゴ以外を強く拾いやすくなる。
     LogoScan(int scanw, int scanh, int logUVx, int logUVy, int thy);
+
+    // AddFrame で受理されたフレーム数を返す
+    int getNumFrames() const { return nframes; }
 
     void Normalize(int mavx);
 
-    std::unique_ptr<LogoData> GetLogo(bool clean) const;
+    std::unique_ptr<LogoData> GetLogo(bool clean, LogoColorMode colorMode = LogoColorMode::NormalYUV) const;
+
+    LogoQualityMetrics CalcQualityMetrics(LogoData& data, LogoColorMode colorMode = LogoColorMode::NormalYUV) const;
 
     template <typename pixel_t>
     void AddScanFrame(
@@ -209,7 +255,11 @@ public:
             tmpV.push_back(srcV[scanUVw - 1 + y * pitchUV]);
         }
 
-        // 最小と最大が閾値以上離れている場合、単一色でないと判断
+        // 最小と最大が閾値以上離れている場合、単一色背景ではないと判断して棄却。
+        // 具体例:
+        //   - 場面転換直後で外周に高コントラストが入るフレーム
+        //   - レターボックス境界が外周にかかるフレーム
+        // これらを早期除外することで、サンプル数より品質を優先する。
         std::sort(tmpY.begin(), tmpY.end());
         if (abs(tmpY.front() - tmpY.back()) > (thy << (bitdepth - 8))) { // オリジナルだと thy * 8
             return false;
@@ -227,20 +277,73 @@ public:
         int bgU = med_average(tmpU);
         int bgV = med_average(tmpV);
 
-        // 有効フレームを追加
+        // 有効フレームのみ統計へ加算。
+        // 目的:
+        //   fg/bgの組が偏った「悪い多数サンプル」を防ぎ、
+        //   透過ロゴ推定に有効なサンプル集合を作る。
         AddScanFrame(srcY, srcU, srcV, pitchY, pitchUV, bgY, bgU, bgV, bitdepth);
 
+        return true;
+    }
+
+    template <typename pixel_t>
+    bool AddFrameYOnlyNeutralUV(
+        const pixel_t* srcY,
+        int pitchY, int bitdepth) {
+        const int scanUVw = scanw >> logUVx;
+        const int scanUVh = scanh >> logUVy;
+
+        tmpY.clear();
+        tmpY.reserve((scanw + scanh - 1) * 2);
+
+        for (int x = 0; x < scanw; x++) {
+            tmpY.push_back(srcY[x]);
+            tmpY.push_back(srcY[x + (scanh - 1) * pitchY]);
+        }
+        for (int y = 1; y < scanh - 1; y++) {
+            tmpY.push_back(srcY[y * pitchY]);
+            tmpY.push_back(srcY[scanw - 1 + y * pitchY]);
+        }
+
+        std::sort(tmpY.begin(), tmpY.end());
+        if (abs(tmpY.front() - tmpY.back()) > (thy << (bitdepth - 8))) {
+            return false;
+        }
+
+        const int bgY = med_average(tmpY);
+        const int neutralUV = 1 << std::max(0, bitdepth - 1);
+        const double normalize = 1.0 / ((1 << bitdepth) - 1);
+        const double bgYNorm = bgY * normalize;
+        const double neutralNorm = neutralUV * normalize;
+
+        for (int y = 0; y < scanh; y++) {
+            for (int x = 0; x < scanw; x++) {
+                logoY[x + y * scanw].Add(srcY[x + y * pitchY] * normalize, bgYNorm);
+            }
+        }
+        for (int y = 0; y < scanUVh; y++) {
+            for (int x = 0; x < scanUVw; x++) {
+                logoU[x + y * scanUVw].Add(neutralNorm, neutralNorm);
+                logoV[x + y * scanUVw].Add(neutralNorm, neutralNorm);
+            }
+        }
+
+        nframes++;
         return true;
     }
 };
 
 class SimpleVideoReader : AMTObject {
 public:
+    using FirstFrameCallback = std::function<void(AVStream *videoStream, AVFrame* frame)>;
+    using FrameCallback = std::function<bool(AVFrame* frame)>;
+
     SimpleVideoReader(AMTContext& ctx);
 
     int64_t currentPos;
 
     void readAll(const tstring& src, int serviceid);
+    void readAll(const tstring& src, int serviceid, const FirstFrameCallback& onFirstFrameCb, const FrameCallback& onFrameCb);
 
 protected:
     virtual void onFirstFrame(AVStream *videoStream, AVFrame* frame);;
@@ -277,6 +380,17 @@ void CopyY(float* dst, const pixel_t* src, int srcPitch, int w, int h) {
 }
 
 typedef bool(*LOGO_ANALYZE_CB)(float progress, int nread, int total, int ngather);
+// 自動検出進捗コールバック。
+// stageの意味:
+//   1: 初期フレーム走査
+//   2: 仮推定とFrameGate準備
+//   3: 最終推定と矩形決定
+//   4: 完了
+// 背景:
+//   ロゴ自動検出は複数passの scan/再推定を挟むため、
+//   stage/stageProgress は pass 切替時にも逆走しないよう
+//   大きめの処理区間にまとめて通知する。
+typedef bool(*LOGO_AUTODETECT_CB)(int stage, float stageProgress, float progress, int nread, int total);
 
 class LogoScanDataCompressed {
 public:
@@ -354,13 +468,46 @@ class LogoAnalyzer : AMTObject {
     int logUVx, logUVy;
     int imgw, imgh;
     int numFrames;
+    tstring debugpath;
     std::unique_ptr<LogoData> logodata;
+    LogoQualityMetrics logoQuality;
+    bool validateQuality;
 
     float progressbase;
 
     std::unique_ptr<InitialLogoCreator> creator;
 
     void MakeInitialLogo();
+    void SaveDebugLogo() const {
+        if (debugpath.empty() || logodata == nullptr) {
+            return;
+        }
+        try {
+            LogoHeader header(scanw, scanh, logUVx, logUVy, imgw, imgh, scanx, scany, "Debug");
+            header.serviceId = serviceid;
+            logodata->Save(debugpath, &header);
+        } catch (const Exception&) {
+        }
+    }
+
+    void LogLogoQuality(const tchar* phase) const;
+    void ValidateLogoQuality() const;
+    double GetResolutionScale() const {
+        if (imgw <= 0 || imgh <= 0) {
+            return 1.0;
+        }
+        return std::max(0.25, std::min(1.0, imgh / 1080.0));
+    }
+    int GetAdjustedBackgroundThreshold() const {
+        const double resolutionScale = GetResolutionScale();
+        const double gain = std::max(1.0, std::min(1.75, 1.0 / std::sqrt(std::max(1.0e-6, resolutionScale))));
+        return std::max(1, (int)std::lround(thy * gain));
+    }
+    int GetEligibleFadeMinIndex() const {
+        const double resolutionScale = GetResolutionScale();
+        const double fadeScale = std::max(0.65, std::min(1.0, std::sqrt(std::max(1.0e-6, resolutionScale))));
+        return std::max(5, std::min(9, (int)std::lround(9.0 * fadeScale)));
+    }
 
     template <typename pixel_t>
     void ReMakeLogo()  {
@@ -420,10 +567,15 @@ class LogoAnalyzer : AMTObject {
             numMinFades[minFades[i]]++;
         }
         int maxi = (int)(std::max_element(numMinFades.begin(), numMinFades.end()) - numMinFades.begin());
-        printf("maxi = %d (%.1f%%)\n", maxi, numMinFades[maxi] / (float)numFrames * 100.0f);
+        const int eligibleFadeMin = GetEligibleFadeMinIndex();
+        ctx.infoF(_T("[GenLogo] dominant fade: index=%d rate=%.1f%% eligibleFadeMin=%d"),
+            maxi, numMinFades[maxi] / (float)numFrames * 100.0f, eligibleFadeMin);
 
-        LogoScan logoscan(scanw, scanh, logUVx, logUVy, thy);
-        {
+        int usedEligibleFadeMin = eligibleFadeMin;
+        int eligibleFrames = 0;
+        auto remakeLogoWithFadeMin = [&](const int fadeMin, int& outEligibleFrames) {
+            LogoScan logoscan(scanw, scanh, logUVx, logUVy, GetAdjustedBackgroundThreshold());
+            outEligibleFrames = 0;
             int scanUVw = scanw >> logUVx;
             int scanUVh = scanh >> logUVy;
             int offU = scanw * scanh;
@@ -434,27 +586,69 @@ class LogoAnalyzer : AMTObject {
                 memScanData.resize(creator->getFrameSize(i));
                 creator->getFrame(i, memScanData.data());
                 // ロゴのあるフレームだけAddFrame
-                if (minFades[i] > 8) { // TODO: 調整
+                if (minFades[i] >= fadeMin) {
+                    outEligibleFrames++;
                     const auto ptr = memScanData.data();
                     logoscan.AddFrame(ptr, ptr + offU, ptr + offV, scanw, scanUVw, creator->bitdepth());
                 }
 
-                if ((i % 2000) == 0) printf("%d frames\n", i);
+                if (((i + 1) % 2000) == 0 || (i + 1) == numFrames) {
+                    ctx.infoF(_T("[GenLogo] eligible frame collect: %d/%d fadeMin=%d eligible=%d"),
+                        i + 1, numFrames, fadeMin, outEligibleFrames);
+                }
             }
-        }
+            auto candidate = logoscan.GetLogo(true);
+            if (candidate != nullptr) {
+                logoQuality = logoscan.CalcQualityMetrics(*candidate);
+            }
+            return candidate;
+        };
 
         // ロゴ作成
-        logodata = logoscan.GetLogo(true);
+        logodata = remakeLogoWithFadeMin(eligibleFadeMin, eligibleFrames);
+        if (logodata == nullptr && validateQuality) {
+            std::vector<int> retryFadeMins;
+            auto addRetryFadeMin = [&](const int value) {
+                const int fadeMin = std::max(0, std::min(numFade - 1, value));
+                if (fadeMin < eligibleFadeMin &&
+                    std::find(retryFadeMins.begin(), retryFadeMins.end(), fadeMin) == retryFadeMins.end()) {
+                    retryFadeMins.push_back(fadeMin);
+                }
+            };
+            addRetryFadeMin(eligibleFadeMin - 2);
+            addRetryFadeMin(5);
+            addRetryFadeMin(3);
+            addRetryFadeMin(1);
+            addRetryFadeMin(0);
+            for (const int retryFadeMin : retryFadeMins) {
+                int retryEligibleFrames = 0;
+                ctx.infoF(_T("[GenLogo] retry logo remake with relaxed fadeMin=%d (strict=%d)"),
+                    retryFadeMin, eligibleFadeMin);
+                auto retryLogo = remakeLogoWithFadeMin(retryFadeMin, retryEligibleFrames);
+                if (retryLogo != nullptr) {
+                    logodata = std::move(retryLogo);
+                    usedEligibleFadeMin = retryFadeMin;
+                    eligibleFrames = retryEligibleFrames;
+                    ctx.infoF(_T("[GenLogo] relaxed fadeMin succeeded: fadeMin=%d eligible=%d/%d"),
+                        usedEligibleFadeMin, eligibleFrames, numFrames);
+                    break;
+                }
+            }
+        }
+        if (logodata != nullptr) {
+            LogLogoQuality(_T("remake"));
+        }
 
         if (logodata == nullptr) {
-            THROW(RuntimeException, "Insufficient logo frames");
+            THROWF(RuntimeException, "Insufficient logo frames (eligible=%d, total=%d, eligibleFadeMin=%d, dominantFade=%d, dominantFadeRate=%.1f%%)",
+                eligibleFrames, numFrames, usedEligibleFadeMin, maxi, numMinFades[maxi] / (float)numFrames * 100.0f);
         }
     }
 
 public:
     LogoAnalyzer(AMTContext& ctx, const tchar* srcpath, int serviceid, const tchar* workfile, const tchar* dstpath,
-        int imgx, int imgy, int w, int h, int thy, int numMaxFrames,
-        LOGO_ANALYZE_CB cb);
+        const tchar* debugpath, int imgx, int imgy, int w, int h, int thy, int numMaxFrames,
+        LOGO_ANALYZE_CB cb, bool validateQuality);
 
     void ScanLogo();
 };

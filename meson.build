@@ -18,7 +18,7 @@ ssse3_args = cpp_args + ['-mssse3']
 sse41_args = cpp_args + ['-msse4.1']
 avx_args = cpp_args + ['-mavx', '-mpopcnt']
 avx2_args = cpp_args + ['-mavx2', '-mfma', '-mpopcnt', '-mbmi', '-mbmi2']
-avx512_args = cpp_args + ['-mavx512f', '-mavx512bw', '-mpopcnt', '-mbmi', '-mbmi2']
+avx512_args = cpp_args + ['-mavx512f', '-mavx512bw', '-mfma', '-mpopcnt', '-mbmi', '-mbmi2']
 
 # 依存ライブラリ
 ffmpeg_dep = [
@@ -93,6 +93,7 @@ subdir('common')
 subdir('TVCaptionMod2/Caption_src')
 subdir('Amatsukaze')
 subdir('AmatsukazeCLI')
+subdir('AmatsukazeGenLogo')
 
 ## C#プロジェクトのビルドを追加（Linux対応）
 #if get_option('build_csharp_projects')

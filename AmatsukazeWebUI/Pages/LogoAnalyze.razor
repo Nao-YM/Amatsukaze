@@ -10,20 +10,20 @@
 
 <h3>Logo Analyze</h3>
 
-@if (!string.IsNullOrEmpty(_error))
-{
-    <p style="color: red;">@_error</p>
-}
-else if (!string.IsNullOrEmpty(_actionMessage))
-{
-    <p style="color: green;">@_actionMessage</p>
-}
-else if (_loading)
+@if (_loading)
 {
     <p>Loading...</p>
 }
 else
 {
+    @if (!string.IsNullOrEmpty(_error))
+    {
+        <p style="color: red;">@_error</p>
+    }
+    @if (!string.IsNullOrEmpty(_actionMessage))
+    {
+        <p style="color: green;">@_actionMessage</p>
+    }
     <div class="logo-analyze">
         <div class="logo-analyze-toolbar">
             <button class="btn btn-outline-secondary" @onclick="BackToQueue">Back to Queue</button>
@@ -132,33 +132,49 @@ else
     private string? _frameLoadLog;
     private CancellationTokenSource? _pollCts;
     private Task? _pollTask;
+    private static readonly TimeSpan InitialLoadTimeout = TimeSpan.FromSeconds(30);
 
     protected override async Task OnInitializedAsync()
     {
-        if (!QueueItemId.HasValue || QueueItemId.Value <= 0)
+        try
         {
-            _error = "queueItemId is required.";
+            if (!QueueItemId.HasValue || QueueItemId.Value <= 0)
+            {
+                _error = "queueItemId is required.";
+                _loading = false;
+                return;
+            }
+
+            var req = new LogoPreviewSessionRequest
+            {
+                QueueItemId = QueueItemId.Value,
+                ServiceId = 0
+            };
+
+            var resTask = Api.CreateLogoPreviewSessionAsync(req);
+            if (await Task.WhenAny(resTask, Task.Delay(InitialLoadTimeout)) != resTask)
+            {
+                _error = "Logo preview session の初期化がタイムアウトしました。";
+                _loading = false;
+                return;
+            }
+            var res = await resTask;
+            if (!res.Ok || res.Data?.SessionId == null)
+            {
+                _error = res.Error ?? "Failed to create preview session.";
+                _loading = false;
+                return;
+            }
+
+            _sessionId = res.Data.SessionId;
+            _frameUrl = BuildFrameUrl(_position);
             _loading = false;
-            return;
         }
-
-        var req = new LogoPreviewSessionRequest
+        catch (Exception ex)
         {
-            QueueItemId = QueueItemId.Value,
-            ServiceId = 0
-        };
-
-        var res = await Api.CreateLogoPreviewSessionAsync(req);
-        if (!res.Ok || res.Data?.SessionId == null)
-        {
-            _error = res.Error ?? "Failed to create preview session.";
+            _error = ex.Message;
             _loading = false;
-            return;
         }
-
-        _sessionId = res.Data.SessionId;
-        _frameUrl = BuildFrameUrl(_position);
-        _loading = false;
     }
 
     private void BackToQueue()
@@ -330,7 +346,7 @@ else
         }, token);
     }
 
-    private string BuildImageUrl(string path)
+    private string BuildImageUrl(string path, bool noCache = false)
     {
         var baseUri = ApiBase.Uri;
         if (string.Equals(baseUri.Scheme, Uri.UriSchemeFile, StringComparison.OrdinalIgnoreCase))
@@ -339,7 +355,13 @@ else
         }
         var baseText = baseUri.ToString().TrimEnd('/');
         var tail = path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path;
-        return baseText + tail;
+        if (!noCache)
+        {
+            return baseText + tail;
+        }
+        var sep = tail.Contains("?", StringComparison.Ordinal) ? "&" : "?";
+        var nonce = DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture);
+        return baseText + tail + sep + "t=" + nonce;
     }
 
     private void UpdateProgress(LogoAnalyzeStatus? status)

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace jpeg_utils {
@@ -39,5 +40,20 @@ bool compressYUV444PToJpeg(
     int width, int height,
     int quality,
     std::vector<uint8_t>& output);
+
+// BGR (packed, 3bytes/pixel) のフレームデータを JPEG に圧縮する
+// bgrData: BGRピクセルデータ (B,G,R,B,G,R,...)
+// stride: 行ピッチ(bytes)
+// width, height: 画像サイズ
+// quality: JPEG品質 (1-100)
+// output: 圧縮結果の JPEG バイト列（appendではなく上書き）
+// turboJpegErrorDetail: 非null のとき、失敗時に TurboJPEG のエラー文字列を設定する（デバッグ用）
+// 戻り値: 成功時 true
+bool compressBGRToJpeg(
+    const uint8_t* bgrData, int stride,
+    int width, int height,
+    int quality,
+    std::vector<uint8_t>& output,
+    std::string* turboJpegErrorDetail = nullptr);
 
 } // namespace jpeg_utils

@@ -855,6 +855,26 @@ namespace Amatsukaze.Server
         [DataMember]
         public bool LogoPendAsError { get; set; }
         [DataMember]
+        public bool AutoLogoPendingDisabled { get; set; }
+        [DataMember]
+        public int AutoLogoPendingDivX { get; set; }
+        [DataMember]
+        public int AutoLogoPendingDivY { get; set; }
+        [DataMember]
+        public int AutoLogoPendingSearchFrames { get; set; }
+        [DataMember]
+        public int AutoLogoPendingBlockSize { get; set; }
+        [DataMember]
+        public int AutoLogoPendingThreshold { get; set; }
+        [DataMember]
+        public int AutoLogoPendingMarginX { get; set; }
+        [DataMember]
+        public int AutoLogoPendingMarginY { get; set; }
+        [DataMember]
+        public int AutoLogoPendingThreadN { get; set; }
+        [DataMember]
+        public bool AutoLogoPendingDetailedDebug { get; set; }
+        [DataMember]
         public bool DumpFilter { get; set; }
         // CM解析のみ実行時にtrimn.avsを入力ディレクトリにコピーする
         [DataMember]
@@ -1106,6 +1126,13 @@ namespace Amatsukaze.Server
         Canceled,       // キャンセルされた
     }
 
+    public enum AutoLogoResultState
+    {
+        None,
+        Success,
+        Failed,
+    }
+
     public enum GenreSpace
     {
         ARIB = 0,
@@ -1197,6 +1224,16 @@ namespace Amatsukaze.Server
         [DataMember]
         public List<string> Tags { get; set; }
 
+        [DataMember]
+        public AutoLogoResultState AutoLogoResult { get; set; }
+        [DataMember]
+        public string AutoLogoLastMessage { get; set; }
+
+        [DataMember]
+        public bool AutoLogoQueued { get; set; }
+        [DataMember]
+        public bool AutoLogoInProgress { get; set; }
+
         // 内部処理順決定用パラメータ
         public int Order { get; set; }
 
@@ -1255,6 +1292,20 @@ namespace Amatsukaze.Server
             State = QueueState.LogoPending;
             EncodeStart = new DateTime();
             EncodeTime = new TimeSpan();
+            ClearAutoLogoTransientState();
+        }
+
+        public void ClearAutoLogoTransientState()
+        {
+            AutoLogoQueued = false;
+            AutoLogoInProgress = false;
+        }
+
+        public void ResetAutoLogoAttempt()
+        {
+            AutoLogoResult = AutoLogoResultState.None;
+            AutoLogoLastMessage = null;
+            ClearAutoLogoTransientState();
         }
     }
 

@@ -63,6 +63,7 @@ namespace Amatsukaze.Server
         private Action finishRequested;
 
         private QueueManager queueManager;
+        private AutoLogoPendingResolver autoLogoPendingResolver;
         private ScheduledQueue scheduledQueue;
         private WorkerPool workerPool;
 
@@ -299,6 +300,7 @@ namespace Amatsukaze.Server
             serverPort = port;
 
             queueManager = new QueueManager(this);
+            autoLogoPendingResolver = new AutoLogoPendingResolver(this);
             drcsManager = new DRCSManager(this);
 
             LoadAppData();
@@ -534,6 +536,7 @@ namespace Amatsukaze.Server
             {
                 queueManager.LoadAppData();
                 Debug.Print("[Init] キュー状態の復元が完了しました");
+                autoLogoPendingResolver?.ScheduleEligiblePendingItems();
                 
                 if (AppData_.setting.PauseOnStarted && queueManager.GetQueueSnapshot().Any(s => s.IsActive))
                 {
@@ -579,10 +582,13 @@ namespace Amatsukaze.Server
             Debug.Print("[Init] バックグラウンドスレッドの開始を開始します");
             try
             {
-                watchFileThread = WatchFileThread();
-                saveSettingThread = SaveSettingThread();
-                queueThread = QueueThread();
-                drcsThread = DrcsThread();
+                // asyncメソッドは最初のawaitまで呼び出し元スレッドで同期実行されるため、
+                // 起動時に重い処理/例外経路へ入ると初期化がブロックされることがある。
+                // 初期化シーケンスを確実に進めるため、明示的にThreadPool上で起動する。
+                watchFileThread = Task.Run(WatchFileThread);
+                saveSettingThread = Task.Run(SaveSettingThread);
+                queueThread = Task.Run(QueueThread);
+                drcsThread = Task.Run(DrcsThread);
                 Debug.Print("[Init] バックグラウンドスレッドの開始が完了しました");
             }
             catch (Exception ex)
@@ -982,11 +988,73 @@ namespace Amatsukaze.Server
             }
         }
 
+        private void UpdateFromVersion2()
+        {
+            // LogoPending自動補完設定を追加 //
+            int NextVersion = 3;
+
+            if (AppData_.Version < NextVersion)
+            {
+                if (AppData_.setting != null)
+                {
+                    AppData_.setting.AutoLogoPendingDisabled = false;
+                    AppData_.setting.AutoLogoPendingDivX = 5;
+                    AppData_.setting.AutoLogoPendingDivY = 5;
+                    AppData_.setting.AutoLogoPendingSearchFrames = 10000;
+                    AppData_.setting.AutoLogoPendingBlockSize = 32;
+                    AppData_.setting.AutoLogoPendingThreshold = 12;
+                    AppData_.setting.AutoLogoPendingMarginX = 6;
+                    AppData_.setting.AutoLogoPendingMarginY = 6;
+                    AppData_.setting.AutoLogoPendingThreadN = 0;
+                    AppData_.setting.AutoLogoPendingDetailedDebug = false;
+                }
+
+                // 現在バージョンに更新
+                AppData_.Version = NextVersion;
+
+                // 起動処理で落ちると２重に処理することになるので、
+                // ここで設定ファイルに書き込んでおく
+                SaveAppData();
+            }
+        }
+
+        private void UpdateFromVersion3()
+        {
+            // 旧デフォルト(1/4, 20000f, margin 4x4)を新デフォルトへ移行 //
+            int NextVersion = 4;
+
+            if (AppData_.Version < NextVersion)
+            {
+                if (AppData_.setting != null &&
+                    AppData_.setting.AutoLogoPendingDivX == 4 &&
+                    AppData_.setting.AutoLogoPendingDivY == 4 &&
+                    AppData_.setting.AutoLogoPendingSearchFrames == 20000 &&
+                    AppData_.setting.AutoLogoPendingBlockSize == 32 &&
+                    AppData_.setting.AutoLogoPendingThreshold == 12 &&
+                    AppData_.setting.AutoLogoPendingMarginX == 4 &&
+                    AppData_.setting.AutoLogoPendingMarginY == 4 &&
+                    AppData_.setting.AutoLogoPendingThreadN == 0 &&
+                    AppData_.setting.AutoLogoPendingDetailedDebug == false)
+                {
+                    AppData_.setting.AutoLogoPendingDivX = 5;
+                    AppData_.setting.AutoLogoPendingDivY = 5;
+                    AppData_.setting.AutoLogoPendingSearchFrames = 10000;
+                    AppData_.setting.AutoLogoPendingMarginX = 6;
+                    AppData_.setting.AutoLogoPendingMarginY = 6;
+                }
+
+                AppData_.Version = NextVersion;
+                SaveAppData();
+            }
+        }
+
         private void UpdateFromOldVersion()
         {
             // 古いバージョンからのアップデート処理
             UpdateFromVersion0();
             UpdateFromVersion1();
+            UpdateFromVersion2();
+            UpdateFromVersion3();
         }
 
         #region メッセージ出力
@@ -1342,10 +1410,68 @@ namespace Amatsukaze.Server
             return value > 0 ? value : defaultValue;
         }
 
+        private const int AutoLogoPendingDefaultDivX = 5;
+        private const int AutoLogoPendingDefaultDivY = 5;
+        private const int AutoLogoPendingDefaultSearchFrames = 10000;
+        private const int AutoLogoPendingDefaultBlockSize = 32;
+        private const int AutoLogoPendingDefaultThreshold = 12;
+        private const int AutoLogoPendingDefaultMarginX = 6;
+        private const int AutoLogoPendingDefaultMarginY = 6;
+        private const int AutoLogoPendingDefaultThreadN = 0;
+        private const bool AutoLogoPendingDefaultDetailedDebug = false;
+
+        private static void NormalizeAutoLogoPendingSettings(Setting setting)
+        {
+            if (setting == null)
+            {
+                return;
+            }
+
+            if (setting.AutoLogoPendingDivX <= 0)
+            {
+                setting.AutoLogoPendingDivX = AutoLogoPendingDefaultDivX;
+            }
+            if (setting.AutoLogoPendingDivY <= 0)
+            {
+                setting.AutoLogoPendingDivY = AutoLogoPendingDefaultDivY;
+            }
+            if (setting.AutoLogoPendingSearchFrames <= 0)
+            {
+                setting.AutoLogoPendingSearchFrames = AutoLogoPendingDefaultSearchFrames;
+            }
+            if (setting.AutoLogoPendingBlockSize <= 0)
+            {
+                setting.AutoLogoPendingBlockSize = AutoLogoPendingDefaultBlockSize;
+            }
+            if (setting.AutoLogoPendingThreshold <= 0)
+            {
+                setting.AutoLogoPendingThreshold = AutoLogoPendingDefaultThreshold;
+            }
+            if (setting.AutoLogoPendingMarginX < 0)
+            {
+                setting.AutoLogoPendingMarginX = AutoLogoPendingDefaultMarginX;
+            }
+            if (setting.AutoLogoPendingMarginY < 0)
+            {
+                setting.AutoLogoPendingMarginY = AutoLogoPendingDefaultMarginY;
+            }
+            if (setting.AutoLogoPendingThreadN < 0)
+            {
+                setting.AutoLogoPendingThreadN = AutoLogoPendingDefaultThreadN;
+            }
+        }
+
         private Setting GetDefaultSetting()
         {
-            var setting = SetDefaultPath(new Setting() { NumParallel = 1, NumParallelLogoAnalysis = 0, DeleteOldLogsDays = 180 });
+            var setting = SetDefaultPath(new Setting()
+            {
+                NumParallel = 1,
+                NumParallelLogoAnalysis = 0,
+                DeleteOldLogsDays = 180,
+                AutoLogoPendingDisabled = false
+            });
             NormalizeTrimAdjustSettings(setting);
+            NormalizeAutoLogoPendingSettings(setting);
             return setting;
         }
 
@@ -1394,6 +1520,7 @@ namespace Amatsukaze.Server
                 AppData_.setting.DeleteOldLogsDays = 180;
             }
             NormalizeTrimAdjustSettings(AppData_.setting);
+            NormalizeAutoLogoPendingSettings(AppData_.setting);
             if (AppData_.scriptData == null)
             {
                 AppData_.scriptData = new MakeScriptData();
@@ -2238,6 +2365,8 @@ namespace Amatsukaze.Server
                 {
                     sb.Append(" --no-delogo");
                 }
+                sb.Append(" --auto-logo-detect ")
+                    .Append(setting.AutoLogoPendingDisabled ? 0 : 1);
                 if (profile.ParallelLogoAnalysis)
                 {
                     sb.Append(" --parallel-logo-analysis ");
@@ -3364,6 +3493,7 @@ namespace Amatsukaze.Server
                 {
                     SetDefaultPath(data.Setting);
                     CheckSetting(null, data.Setting);
+                    NormalizeAutoLogoPendingSettings(data.Setting);
                     AppData_.setting = data.Setting;
                     workerPool.SetNumParallel(data.Setting.NumParallel);
                     SetScheduleParam(AppData_.setting.SchedulingEnabled,
@@ -3413,6 +3543,15 @@ namespace Amatsukaze.Server
         {
             string dirpath = "logo";
             var message = "ロゴファイルの保存に失敗しました。";
+            if (logoData.IsAutoLogoPendingResult &&
+                logoData.SourceQueueItemId > 0 &&
+                autoLogoPendingResolver != null &&
+                autoLogoPendingResolver.ShouldDiscardAutoResult(logoData.SourceQueueItemId))
+            {
+                return NotifyMessage(
+                    "手動採用済みのため自動ロゴ生成結果を破棄しました: QID=" + logoData.SourceQueueItemId,
+                    false);
+            }
             Directory.CreateDirectory(dirpath);
             string prefix = Path.Combine(dirpath, "SID" + logoData.ServiceId.ToString() + "-");
             try
@@ -3447,6 +3586,10 @@ namespace Amatsukaze.Server
                         catch(IOException) { }
                     }
                     waits.Add(NotifyMessage(message, false));
+                }
+                if (!logoData.IsAutoLogoPendingResult && logoData.SourceQueueItemId > 0)
+                {
+                    autoLogoPendingResolver?.NotifyManualLogoAccepted(logoData.SourceQueueItemId);
                 }
                 return Task.WhenAll(waits);
             }
@@ -3637,6 +3780,21 @@ namespace Amatsukaze.Server
             serviceListUpdated = true;
         }
 
+        internal void NotifyManualLogoAccepted(int queueItemId)
+        {
+            autoLogoPendingResolver?.NotifyManualLogoAccepted(queueItemId);
+        }
+
+        internal void TryKickAutoLogoPending(QueueItem item)
+        {
+            autoLogoPendingResolver?.TryKick(item);
+        }
+
+        internal void ScheduleEligibleAutoLogoPendingItems()
+        {
+            autoLogoPendingResolver?.ScheduleEligiblePendingItems();
+        }
+
 #region QueueManager
         // アイテム状態の更新をクライアントに通知
         internal Task NotifyQueueItemUpdate(QueueItem item)
@@ -3656,6 +3814,11 @@ namespace Amatsukaze.Server
         internal List<Task> UpdateQueueItems(List<Task> waits)
         {
             return queueManager.UpdateQueueItems(waits);
+        }
+
+        internal List<QueueItem> GetQueueSnapshot()
+        {
+            return queueManager.GetQueueSnapshot();
         }
 
         internal QueueItem[] GetQueueItems(string srcPath)

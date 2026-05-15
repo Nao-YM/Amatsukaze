@@ -104,6 +104,7 @@ namespace Amatsukaze.Server.Rest
         public int Height { get; set; }
         public int Threshold { get; set; }
         public int MaxFrames { get; set; }
+        public bool ValidateQuality { get; set; }
     }
 
     public class LogoPreviewSessionRequest
@@ -129,6 +130,81 @@ namespace Amatsukaze.Server.Rest
         public int Pass { get; set; }
         public string LogoFileName { get; set; }
         public string ImageUrl { get; set; }
+        public string DebugImageUrl { get; set; }
+    }
+
+    public class LogoAutoDetectStartRequest
+    {
+        public int QueueItemId { get; set; }
+        public int DivX { get; set; } = 5;
+        public int DivY { get; set; } = 5;
+        public int SearchFrames { get; set; } = 10000;
+        public int BlockSize { get; set; } = 32;
+        public int Threshold { get; set; } = 12;
+        public int MarginX { get; set; } = 6;
+        public int MarginY { get; set; } = 6;
+        public int ThreadN { get; set; } = 0;
+        public bool DetailedDebug { get; set; } = false;
+    }
+
+    public class LogoRect
+    {
+        public int X { get; set; }
+        public int Y { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+    }
+
+    public class LogoAutoDetectDebugImages
+    {
+        public string ScoreUrl { get; set; }
+        public string BinaryUrl { get; set; }
+        public string CclUrl { get; set; }
+        public string CountUrl { get; set; }
+        public string AUrl { get; set; }
+        public string BUrl { get; set; }
+        public string AlphaUrl { get; set; }
+        public string LogoYUrl { get; set; }
+        public string ConsistencyUrl { get; set; }
+        public string FgVarUrl { get; set; }
+        public string BgVarUrl { get; set; }
+        public string TransitionUrl { get; set; }
+        public string KeepRateUrl { get; set; }
+        public string AcceptedUrl { get; set; }
+        public string FrameGateUrl { get; set; }
+    }
+
+    public class LogoAutoDetectStatus
+    {
+        public string JobId { get; set; }
+        public bool Completed { get; set; }
+        public string Error { get; set; }
+        public float Progress { get; set; }
+        public int Stage { get; set; }
+        public string StageName { get; set; }
+        public float StageProgress { get; set; }
+        public int NumRead { get; set; }
+        public int NumTotal { get; set; }
+        public LogoRect DetectedRect { get; set; }
+        public int RectDetectFailCode { get; set; }
+        public string RectDetectFailName { get; set; }
+        public int LogoAnalyzeFailCode { get; set; }
+        public string LogoAnalyzeFailName { get; set; }
+        public double? Pass1ScoreMax { get; set; }
+        public double? Pass2ScoreMax { get; set; }
+        public double? FinalScoreBeforeRescueMax { get; set; }
+        public bool Pass2Entered { get; set; }
+        public bool Pass2PrepareSucceeded { get; set; }
+        public bool Pass2CollectSucceeded { get; set; }
+        public bool Pass2RescueFallbackApplied { get; set; }
+        public int Pass2FailBeforeClearCode { get; set; }
+        public string Pass2FailBeforeClearName { get; set; }
+        public int Pass2FrameMaskNonZero { get; set; }
+        public int Pass2AcceptedFrames { get; set; }
+        public int Pass2SkippedFrames { get; set; }
+        public int FrameGateRetryAttemptCount { get; set; }
+        public int FrameGateRetrySuccessAttempt { get; set; }
+        public LogoAutoDetectDebugImages DebugImages { get; set; }
     }
 
     public class Snapshot

@@ -66,6 +66,7 @@ RUN apt-get update && apt-get install -y \
         zlib1g \
         libz-dev \
         libssl-dev \
+    && apt-get upgrade -y \
     && apt-get clean \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
@@ -260,6 +261,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zlib1g \
         mkvtoolnix \
         opus-tools \
+        && apt-get upgrade -y \
         && apt-get clean \
         && apt-get autoremove -y \
     && if [ "$ENABLE_VCEENCC" = "1" ]; then \
